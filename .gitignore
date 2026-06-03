@@ -1,0 +1,41 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# JumpServer browser profiles
+jumpserver_browser_profile/
+jumpserver_download_browser_profile/
+jumpserver_exec_browser_profile/
+jumpserver_upload_browser_profile/
+
+# Browser cache / crash files
+*.pma
+CrashpadMetrics*
+Crashpad/
+
+# Local data / sensitive files
+account_store.json
+accounts.json
+debug_usage_store.json
+
+# Logs / test outputs
+*.jtl
+*.log
+*.tmp
+
+# Output reports
+output/
+
+# System
+.DS_Store
+Thumbs.db
