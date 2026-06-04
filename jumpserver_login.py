@@ -137,48 +137,69 @@ class JumpServerSession:
 
         # 如果页面上存在登录按钮或密码框，则执行登录
         if self.has_login_form(page):
-            max_retry = 3
+            max_retry = 5
 
             for attempt in range(1, max_retry + 1):
                 print(f"开始登录，第 {attempt} 次尝试")
 
-                self._fill_username(page)
-                self._fill_password(page)
+                try:
+                    self._fill_username(page)
+                    self._fill_password(page)
 
-                # 如果页面上有验证码，则识别、计算并填写
-                self._fill_captcha_if_present(page)
+                    # 如果页面上有验证码，则识别、计算并填写
+                    self._fill_captcha_if_present(page)
 
-                page.get_by_role("button", name="登录").click()
-                page.wait_for_timeout(3000)
+                    page.get_by_role("button", name="登录").click()
+                    page.wait_for_timeout(3000)
 
-                # 登录后进入 Luna
-                page.goto(config.JUMP_LUNA_URL)
-                page.wait_for_load_state("domcontentloaded")
-                page.wait_for_timeout(2500)
+                    # 登录后进入 Luna
+                    page.goto(config.JUMP_LUNA_URL)
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(2500)
 
-                # 如果已经不在登录页，说明登录成功
-                if not self.is_login_page(page):
-                    print("JumpServer 登录成功。")
-                    return
+                    # 如果已经不在登录页，说明登录成功
+                    if not self.is_login_page(page):
+                        print("JumpServer 登录成功。")
+                        return
 
-                print("登录后仍停留在登录页，可能是验证码识别失败、账号密码错误或需要二次验证。")
+                    print("登录后仍停留在登录页，可能是验证码错误、账号密码错误或需要二次验证。")
 
-                # 如果还要重试，先刷新验证码
+                except Exception as e:
+                    print(f"本次登录尝试失败：{e}")
+
+                # 到这里说明本次失败了
                 if attempt < max_retry:
-                    self._refresh_captcha_if_present(page)
-                    page.wait_for_timeout(1000)
+                    print("准备刷新验证码后重试。")
 
-            raise RuntimeError(
-                "JumpServer 登录失败。\n"
-                "请检查账号密码是否正确，或者验证码识别失败，或者页面需要二次验证。"
-            )
+                    try:
+                        # 确保回到登录页
+                        if not self.is_login_page(page):
+                            page.goto(config.JUMP_LOGIN_URL)
+                            page.wait_for_load_state("domcontentloaded")
+                            page.wait_for_timeout(1000)
+
+                        self._refresh_captcha_if_present(page)
+                        page.wait_for_timeout(1000)
+
+                    except Exception as refresh_error:
+                        print(f"刷新验证码失败，重新打开登录页：{refresh_error}")
+                        page.goto(config.JUMP_LOGIN_URL)
+                        page.wait_for_load_state("domcontentloaded")
+                        page.wait_for_timeout(1500)
+
+                    continue
+
+                raise RuntimeError(
+                    "JumpServer 登录失败。\n"
+                    "已重试 3 次。\n"
+                    "请检查账号密码是否正确，或者验证码识别失败，或者页面需要二次验证。"
+                )
 
         # 如果没有识别到登录表单，也尝试进入 Luna
         page.goto(config.JUMP_LUNA_URL)
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(2500)
 
-        # 再检查一次，如果还在登录页，说明登录失败或需要验证码/二次验证
         if self.is_login_page(page):
             raise RuntimeError(
                 "JumpServer 登录后仍停留在登录页。"
@@ -450,13 +471,9 @@ class JumpServerSession:
         """
         修正 ddddocr 对算术验证码的常见误识别。
 
-        例如：
-        1o+4 -> 10+4
-        l0+4 -> 10+4
-        I0+4 -> 10+4
-        10x4 -> 10*4
-        10×4 -> 10*4
-        10÷2 -> 10/2
+        重点：
+        这里不急着判断表达式是否合法，只做字符清洗和替换。
+        后面再从清洗后的字符串中提取真正的算式。
         """
 
         if text is None:
@@ -464,26 +481,32 @@ class JumpServerSession:
 
         text = str(text).strip()
 
-        # 去掉空格
+        # 去掉空格和常见空白
         text = text.replace(" ", "")
+        text = text.replace("\n", "")
+        text = text.replace("\t", "")
 
-        # 常见字符纠正
         replace_map = {
+            # 0 的常见误识别
             "o": "0",
             "O": "0",
             "Q": "0",
 
+            # 1 的常见误识别
             "l": "1",
             "I": "1",
             "|": "1",
 
+            # 乘号
             "×": "*",
             "x": "*",
             "X": "*",
 
+            # 除号
             "÷": "/",
             "／": "/",
 
+            # 加减等号
             "＋": "+",
             "－": "-",
             "—": "-",
@@ -494,31 +517,122 @@ class JumpServerSession:
         for old, new in replace_map.items():
             text = text.replace(old, new)
 
-        # 只保留数字和运算符
+        # 只保留数字、运算符、等号
         text = re.sub(r"[^0-9+\-*/=]", "", text)
 
-        # 去掉等号后面的内容，例如 10+4= -> 10+4
-        if "=" in text:
-            text = text.split("=")[0]
-
         return text
+
+    def _extract_captcha_expression(self, raw_text: str) -> str:
+        """
+        从 OCR 结果里提取真正的算术表达式。
+
+        处理场景：
+
+        1. 正常：
+           8-4      -> 8-4
+           10+4     -> 10+4
+           7*9      -> 7*9
+
+        2. 等号或干扰线被识别成 -
+           7*2-     -> 7*2
+           -7*9-    -> 7*9
+           10+4-    -> 10+4
+
+        3. 运算符被识别到末尾：
+           62-      -> 6-2
+           84-      -> 8-4
+           104+     -> 10+4
+        """
+
+        expression = self._normalize_captcha_text(raw_text)
+
+        print(f"验证码修正后字符串：{expression}")
+
+        if not expression:
+            raise RuntimeError(
+                f"验证码表达式解析失败。\n"
+                f"OCR 原始结果：{raw_text}\n"
+                f"修正后结果为空"
+            )
+
+        # 如果有等号，优先取等号前面的内容
+        # 例如 8-4= -> 8-4
+        if "=" in expression:
+            before_equal = expression.split("=")[0]
+            if before_equal:
+                expression = before_equal
+
+        # 第一优先级：
+        # 从字符串中直接提取正常表达式
+        # 例如：
+        # -7*9- -> 7*9
+        # 7*2-  -> 7*2
+        # 8-4   -> 8-4
+        normal_matches = re.findall(r"\d{1,3}[+\-*/]\d{1,3}", expression)
+
+        if normal_matches:
+            # 通常只有一个，取第一个即可
+            real_expression = normal_matches[0]
+            print(f"验证码提取到正常表达式：{real_expression}")
+            return real_expression
+
+        # 第二优先级：
+        # 处理 62-、84-、104+ 这种，运算符跑到最后的情况
+        tail_operator_match = re.fullmatch(r"(\d{2,})([+\-*/])", expression)
+
+        if tail_operator_match:
+            numbers = tail_operator_match.group(1)
+            operator = tail_operator_match.group(2)
+
+            if len(numbers) == 2:
+                # 62- -> 6-2
+                left_text = numbers[0]
+                right_text = numbers[1]
+            else:
+                # 104+ -> 10+4
+                # 123+ -> 12+3
+                left_text = numbers[:-1]
+                right_text = numbers[-1]
+
+            real_expression = f"{left_text}{operator}{right_text}"
+            print(f"验证码运算符末尾修正后表达式：{real_expression}")
+            return real_expression
+
+        # 第三优先级：
+        # 处理 -84、+95 这种，运算符跑到最前面的情况
+        head_operator_match = re.fullmatch(r"([+\-*/])(\d{2,})", expression)
+
+        if head_operator_match:
+            operator = head_operator_match.group(1)
+            numbers = head_operator_match.group(2)
+
+            if len(numbers) == 2:
+                left_text = numbers[0]
+                right_text = numbers[1]
+            else:
+                left_text = numbers[:-1]
+                right_text = numbers[-1]
+
+            real_expression = f"{left_text}{operator}{right_text}"
+            print(f"验证码运算符开头修正后表达式：{real_expression}")
+            return real_expression
+
+        raise RuntimeError(
+            f"验证码表达式解析失败。\n"
+            f"OCR 原始结果：{raw_text}\n"
+            f"修正后结果：{expression}"
+        )
 
     def _calculate_captcha_result(self, raw_text: str) -> str:
         """
         将 OCR 识别出的算术表达式计算成最终验证码。
 
-        支持：
-        10+4
-        10-4
-        10*4
-        10/2
-
         不使用 eval，避免不安全。
         """
 
-        expression = self._normalize_captcha_text(raw_text)
+        expression = self._extract_captcha_expression(raw_text)
 
-        print(f"验证码修正后表达式：{expression}")
+        print(f"验证码最终用于计算的表达式：{expression}")
 
         match = re.fullmatch(r"(\d+)([+\-*/])(\d+)", expression)
 
@@ -526,7 +640,7 @@ class JumpServerSession:
             raise RuntimeError(
                 f"验证码表达式解析失败。\n"
                 f"OCR 原始结果：{raw_text}\n"
-                f"修正后结果：{expression}"
+                f"最终表达式：{expression}"
             )
 
         left = int(match.group(1))
@@ -545,7 +659,6 @@ class JumpServerSession:
 
             result = left / right
 
-            # 如果是 10/2 这种，结果填 5，不填 5.0
             if result.is_integer():
                 result = int(result)
         else:
