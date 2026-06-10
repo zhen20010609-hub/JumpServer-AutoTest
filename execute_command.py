@@ -4,6 +4,8 @@ from pathlib import Path
 import shlex
 import re
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
 from jumpserver_login import JumpServerSession
 from debug_usage_store import DebugUsageStore
 
@@ -68,25 +70,6 @@ def build_commands(
 ) -> list[str]:
     """
     生成服务器端自动压测 shell 脚本，并返回需要逐行输入到 Web Terminal 的命令。
-
-    当前流程：
-    1. JMX / TXT / CSV 从 /tmp 移动到 zz_polly
-    2. 替换 JMX 中 txt/csv 样本路径
-    3. 可选执行单条测试 smoke，不生成日志
-    4. 参数化 JMX：线程数 / 循环次数
-    5. 如果填写了限制目标 TPS，才修改 Constant Throughput Timer
-    6. 可选执行 debug，日志生成后移动到 /tmp
-    7. 可选执行 formal，日志生成后移动到 /tmp
-    8. 不执行 formal tail
-
-    吞吐量逻辑：
-    - throughput_limit_tps 有值：Constant Throughput Timer = throughput_limit_tps * 60
-    - throughput_limit_tps 为空：不修改 Constant Throughput Timer，使用 JMX 原始配置
-
-    debug 额度计算逻辑：
-    - previous_debug_used_count：当前 JMX 脚本历史累计 debug 消耗
-    - current_debug_used_count：本次如果勾选 debug，本次 debug 消耗
-    - formal 扣除：历史 debug + 本次 debug
     """
 
     local_sample_paths = local_sample_paths or []
@@ -117,21 +100,12 @@ def build_commands(
 
     remote_jmx_path = f"{config.REMOTE_WORK_DIR}/{jmx_filename}"
 
-    # ======================
-    # 吞吐量限制逻辑
-    # ======================
-    # 只有填写了限制目标 TPS，才修改 Constant Throughput Timer
-    # 不填写时，不修改 JMX 原始吞吐量配置，也不传 -Jthroughput_per_min
     if throughput_limit_tps is not None:
         throughput_per_min = throughput_limit_tps * 60
         throughput_jmeter_arg = f" -Jthroughput_per_min={throughput_per_min}"
     else:
         throughput_per_min = None
         throughput_jmeter_arg = ""
-
-    # ======================
-    # 额度计算
-    # ======================
 
     actual_smoke_used_count = smoke_used_count if run_smoke else 0
 
@@ -232,10 +206,6 @@ def build_commands(
         "",
     ])
 
-    # ======================
-    # smoke 单条测试
-    # ======================
-
     if run_smoke:
         script_lines.extend([
             "echo '===== 开始单条测试 / smoke：使用原始脚本配置执行 ====='",
@@ -253,10 +223,6 @@ def build_commands(
             "echo '跳过单条测试 / smoke。'",
             "",
         ])
-
-    # ======================
-    # 参数化线程数 / 循环次数
-    # ======================
 
     script_lines.extend([
         "echo '===== 开始参数化 JMX：线程数 / 循环次数 ====='",
@@ -279,15 +245,10 @@ def build_commands(
         "",
     ])
 
-    # ======================
-    # 可选修改 Constant Throughput Timer
-    # ======================
-
     if throughput_limit_tps is not None:
         script_lines.extend([
             "echo '===== 已填写限制目标 TPS，开始修改 Constant Throughput Timer ====='",
 
-            # Constant Throughput Timer：doubleProp 子节点格式
             (
                 "perl -0pi -e "
                 f"'s#<doubleProp>\\s*<name>throughput</name>\\s*<value>.*?</value>\\s*<savedValue>.*?</savedValue>\\s*</doubleProp>"
@@ -295,7 +256,6 @@ def build_commands(
                 f"{q_jmx_filename}"
             ),
 
-            # Constant Throughput Timer：name 属性格式
             (
                 "perl -0pi -e "
                 f"'s#<(?:doubleProp|stringProp) name=\"throughput\">.*?</(?:doubleProp|stringProp)>"
@@ -311,10 +271,6 @@ def build_commands(
             "echo '未填写限制目标 TPS，跳过 Constant Throughput Timer 修改，使用 JMX 原始吞吐量配置。'",
             "",
         ])
-
-    # ======================
-    # debug 调试压测
-    # ======================
 
     if run_debug:
         script_lines.extend([
@@ -347,10 +303,6 @@ def build_commands(
             "echo '跳过 debug 调试压测。'",
             "",
         ])
-
-    # ======================
-    # formal 正式压测
-    # ======================
 
     if run_formal:
         script_lines.extend([
@@ -394,10 +346,6 @@ def build_commands(
             "",
         ])
 
-    # ======================
-    # 执行计划输出
-    # ======================
-
     script_lines.extend([
         "echo '===== 执行计划 ====='",
         f"echo 'RUN_SMOKE={run_smoke}, RUN_DEBUG={run_debug}, RUN_FORMAL={run_formal}'",
@@ -433,79 +381,213 @@ def build_commands(
     return commands
 
 
+def find_terminal_area(page, timeout_seconds: int = 30, log_func=print):
+    """
+    遍历所有 iframe，查找真正可点击的 xterm 终端区域。
+    """
+
+    log_func("开始查找 Web Terminal 可点击区域...")
+
+    terminal_selectors = [
+        ".xterm-screen",
+        ".xterm-viewport",
+        ".xterm",
+        "div[class*='xterm']",
+    ]
+
+    last_error = None
+
+    for _ in range(timeout_seconds):
+        for frame in page.frames:
+            for selector in terminal_selectors:
+                try:
+                    terminal = frame.locator(selector).first
+
+                    if terminal.count() == 0:
+                        continue
+
+                    terminal.wait_for(state="visible", timeout=1000)
+
+                    box = terminal.bounding_box()
+                    if not box:
+                        continue
+
+                    width = box.get("width", 0)
+                    height = box.get("height", 0)
+
+                    if width < 100 or height < 50:
+                        continue
+
+                    log_func(
+                        f"已找到 Web Terminal 可点击区域：selector={selector}, "
+                        f"width={width}, height={height}"
+                    )
+
+                    return terminal
+
+                except Exception as e:
+                    last_error = e
+                    continue
+
+        page.wait_for_timeout(1000)
+
+    raise RuntimeError(
+        "没有找到 Web Terminal 可点击区域，请确认已经进入压测机终端页面。\n"
+        f"最后一次错误：{last_error}"
+    )
+
+
 def connect_press_server(page, log_func=print):
     """
     连接压测机：prod -> QA -> 10.0.11.247。
+
+    重点：
+    1. 等 Luna 页面内容真正加载出来，再点 prod
+    2. 点击“连接”后，判断是否打开新页面
+    3. 返回真正的 Web Terminal 页面
     """
 
     log_func("准备连接压测机...")
 
-    page.goto(config.JUMP_LUNA_URL)
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(2000)
+    def is_luna_url() -> bool:
+        current_url = page.url.lower()
+        return "/luna/" in current_url and "/core/auth/login" not in current_url
 
-    def click_title_by_prefix(prefix: str):
+    def wait_for_luna_ready(timeout_ms: int = 60000) -> bool:
+        log_func("等待 Luna 页面内容加载完成...")
+
+        asset_pattern = re.compile(
+            rf"^{re.escape(config.ASSET_ENV_TITLE)}(?:\s*\(\d+\))?$"
+        )
+
+        try:
+            page.get_by_title(asset_pattern).first.wait_for(
+                state="visible",
+                timeout=timeout_ms,
+            )
+            log_func(f"已识别到资产环境：{config.ASSET_ENV_TITLE}")
+            return True
+        except Exception:
+            pass
+
+        try:
+            page.get_by_text("文件管理").first.wait_for(
+                state="visible",
+                timeout=3000,
+            )
+            log_func("已识别到 Luna 页面内容：文件管理")
+            return True
+        except Exception:
+            pass
+
+        return False
+
+    if not is_luna_url():
+        log_func("当前不在 Luna 页面，开始进入 Luna。")
+        page.goto(config.JUMP_LUNA_URL)
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(1500)
+    else:
+        log_func("当前 URL 已经是 Luna，先等待页面内容加载，不立即点击资产树。")
+
+    if not wait_for_luna_ready(timeout_ms=60000):
+        log_func("Luna 页面内容等待超时，尝试重新进入 Luna。")
+
+        page.goto(config.JUMP_LUNA_URL)
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(2500)
+
+        if not wait_for_luna_ready(timeout_ms=60000):
+            raise RuntimeError(
+                "Luna 页面加载超时：没有找到资产环境 "
+                f"{config.ASSET_ENV_TITLE}。"
+                "请检查页面是否加载很慢、账号是否有资产权限，或 JumpServer 页面是否异常。"
+            )
+
+    def click_title_by_prefix(prefix: str, timeout_ms: int = 60000):
         pattern = re.compile(rf"^{re.escape(prefix)}(?:\s*\(\d+\))?$")
         locator = page.get_by_title(pattern).first
-        locator.wait_for(state="visible", timeout=10000)
+
+        log_func(f"等待并点击：{prefix}")
+        locator.wait_for(state="visible", timeout=timeout_ms)
+        locator.scroll_into_view_if_needed(timeout=5000)
         locator.click()
 
     click_title_by_prefix(config.ASSET_ENV_TITLE)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(800)
 
     click_title_by_prefix(config.ASSET_GROUP_TITLE)
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(800)
 
-    page.get_by_title(config.ASSET_HOST_TITLE).click()
-    page.wait_for_timeout(500)
+    log_func(f"等待并点击压测机：{config.ASSET_HOST_TITLE}")
+    host = page.get_by_title(config.ASSET_HOST_TITLE).first
+    host.wait_for(state="visible", timeout=60000)
+    host.scroll_into_view_if_needed(timeout=5000)
+    host.click()
+    page.wait_for_timeout(800)
 
-    page.get_by_role("button", name="连接").click()
-    page.wait_for_timeout(5000)
+    log_func("等待并点击连接按钮。")
+    connect_button = page.get_by_role("button", name="连接").first
+    connect_button.wait_for(state="visible", timeout=30000)
+
+    old_pages = list(page.context.pages)
+    terminal_page = None
+
+    try:
+        with page.context.expect_page(timeout=8000) as new_page_info:
+            connect_button.click()
+
+        terminal_page = new_page_info.value
+        terminal_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        terminal_page.set_default_timeout(15000)
+        log_func("检测到 Web Terminal 打开在新页面。")
+
+    except PlaywrightTimeoutError:
+        log_func("未检测到新页面，认为 Web Terminal 在当前页面打开。")
+        terminal_page = page
+
+    current_pages = list(page.context.pages)
+
+    if terminal_page is page and len(current_pages) > len(old_pages):
+        terminal_page = current_pages[-1]
+        terminal_page.wait_for_load_state("domcontentloaded", timeout=30000)
+        terminal_page.set_default_timeout(15000)
+        log_func("兜底检测到新的页面，切换到最新 Web Terminal 页面。")
 
     log_func("已点击连接，等待 Web Terminal 加载。")
 
+    find_terminal_area(terminal_page, timeout_seconds=90, log_func=log_func)
 
-def find_terminal_input(page, timeout_seconds: int = 30, log_func=print):
-    """
-    遍历所有 iframe，查找 Terminal input。
-    """
+    log_func("Web Terminal 已加载完成。")
 
-    log_func("开始查找 Web Terminal 输入框...")
-
-    for _ in range(timeout_seconds):
-        for frame in page.frames:
-            try:
-                terminal_input = frame.get_by_role("textbox", name="Terminal input")
-
-                if terminal_input.count() > 0:
-                    terminal_input.first.wait_for(state="attached", timeout=1000)
-                    log_func("已找到 Terminal input。")
-                    return terminal_input.first
-
-            except Exception:
-                pass
-
-        page.wait_for_timeout(1000)
-
-    raise RuntimeError("没有找到 Web Terminal 输入框，请确认已经进入压测机终端页面。")
+    return terminal_page
 
 
 def paste_commands_to_terminal(page, commands: list[str], log_func=print):
     """
-    逐行输入命令。
+    逐行输入命令到 Web Terminal。
     """
 
     log_func("准备逐行输入命令到 Web Terminal...")
 
-    terminal_input = find_terminal_input(page, log_func=log_func)
+    terminal_area = find_terminal_area(page, log_func=log_func)
 
-    terminal_input.click(force=True)
+    box = terminal_area.bounding_box()
+    if not box:
+        raise RuntimeError("找到终端区域，但是无法获取终端区域坐标。")
+
+    click_x = box["x"] + min(80, box["width"] / 2)
+    click_y = box["y"] + min(40, box["height"] / 2)
+
+    page.mouse.click(click_x, click_y)
     page.wait_for_timeout(500)
 
     for index, cmd in enumerate(commands, start=1):
         log_func(f"正在输入第 {index} 条命令：{cmd}")
 
-        terminal_input.click(force=True)
+        page.mouse.click(click_x, click_y)
+        page.wait_for_timeout(100)
+
         page.keyboard.insert_text(cmd)
         page.keyboard.press("Enter")
 
@@ -515,6 +597,27 @@ def paste_commands_to_terminal(page, commands: list[str], log_func=print):
             page.wait_for_timeout(200)
 
     log_func("所有命令已逐行输入完成，请在网页终端观察执行结果。")
+
+
+def wait_until_browser_closed(page, log_func=print):
+    """
+    无黑框 exe 不能使用 input() 等待用户按回车。
+    命令提交后保持浏览器打开，用户手动关闭浏览器窗口后，程序再结束。
+    """
+
+    log_func("浏览器将保持打开。压测结束后，请手动关闭浏览器窗口。")
+
+    while True:
+        try:
+            if page.is_closed():
+                log_func("检测到浏览器页面已关闭。")
+                break
+
+            page.wait_for_timeout(1000)
+
+        except Exception:
+            log_func("检测到浏览器已关闭或连接已断开。")
+            break
 
 
 def execute_jmeter(
@@ -566,16 +669,19 @@ def execute_jmeter(
         user_data_dir="jumpserver_exec_browser_profile",
     )
 
+    page = None
+    terminal_page = None
+
     try:
         page = session.start()
 
         log_func("登录成功，开始自动连接压测机。")
 
-        connect_press_server(page, log_func=log_func)
+        terminal_page = connect_press_server(page, log_func=log_func)
 
         log_func("等待 Web Terminal 加载完成...")
 
-        paste_commands_to_terminal(page, commands, log_func=log_func)
+        paste_commands_to_terminal(terminal_page, commands, log_func=log_func)
 
         if run_debug and count_debug_used:
             current_debug_used_count = debug_threads * debug_loops
@@ -590,7 +696,21 @@ def execute_jmeter(
 
         log_func("命令已提交。请等待 Web Terminal 中显示“自动压测脚本执行结束”后，再手动关闭浏览器。")
 
-        input("压测结束后按 Enter 关闭浏览器...")
+        wait_until_browser_closed(terminal_page, log_func=log_func)
+
+    except Exception as e:
+        log_func(f"执行过程中发生异常：{e}")
+        log_func("浏览器将保持打开，方便你查看当前页面。手动关闭浏览器后程序结束。")
+
+        try:
+            if terminal_page is not None and not terminal_page.is_closed():
+                wait_until_browser_closed(terminal_page, log_func=log_func)
+            elif page is not None and not page.is_closed():
+                wait_until_browser_closed(page, log_func=log_func)
+        except Exception:
+            pass
+
+        raise
 
     finally:
         session.close()

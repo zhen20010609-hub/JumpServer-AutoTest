@@ -117,93 +117,96 @@ class JumpServerSession:
         """
         登录 JumpServer。
 
-        重点：
-        不能用 `"luna" in page.url` 判断是否已登录，
-        因为登录页本身也有 next=/luna/。
+        优化点：
+        1. 只在最开始进入登录页
+        2. 如果已经登录，不再重复 goto Luna
+        3. 点击登录后等待页面自然跳转，不再强制刷新 Luna
+        4. 验证码失败才刷新验证码重试
         """
 
         page = self.page
 
         page.goto(config.JUMP_LOGIN_URL)
         page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(800)
 
-        # 如果当前页面已经是真正的 Luna 页面，则认为已登录
+        # 如果当前已经是真正的 Luna 页面，直接返回
+        # 不要再 page.goto(config.JUMP_LUNA_URL)，否则会多刷新一次
         if self.is_luna_page(page):
-            page.goto(config.JUMP_LUNA_URL)
-            page.wait_for_load_state("domcontentloaded")
-            page.wait_for_timeout(1500)
+            print("当前已经是 Luna 页面，无需重新登录。")
             return
 
-        # 如果页面上存在登录按钮或密码框，则执行登录
-        if self.has_login_form(page):
-            max_retry = 5
+        # 如果没有登录表单，尝试判断是否已经登录
+        if not self.has_login_form(page):
+            if self.is_luna_page(page) or not self.is_login_page(page):
+                print("当前页面不是登录页，认为已登录。")
+                return
 
-            for attempt in range(1, max_retry + 1):
-                print(f"开始登录，第 {attempt} 次尝试")
+            raise RuntimeError(
+                "当前页面没有识别到登录表单，也没有进入 Luna 页面。"
+                "请检查 JumpServer 页面是否加载异常。"
+            )
+
+        max_retry = 5
+
+        for attempt in range(1, max_retry + 1):
+            print(f"开始登录，第 {attempt} 次尝试")
+
+            try:
+                self._fill_username(page)
+                self._fill_password(page)
+
+                # 如果页面上有验证码，则识别、计算并填写
+                self._fill_captcha_if_present(page)
+
+                page.get_by_role("button", name="登录").click()
+
+                # 等待登录后的自然跳转，不要立刻强制 goto Luna
+                page.wait_for_timeout(1500)
+
+                # 情况 1：已经进入 Luna
+                if self.is_luna_page(page):
+                    print("JumpServer 登录成功，已进入 Luna 页面。")
+                    return
+
+                # 情况 2：已经不在登录页，也可以认为登录成功
+                # 后续 connect_press_server 会进入 JUMP_LUNA_URL
+                if not self.is_login_page(page):
+                    print("JumpServer 登录成功，当前已离开登录页。")
+                    return
+
+                print("登录后仍停留在登录页，可能是验证码错误、账号密码错误或需要二次验证。")
+
+            except Exception as e:
+                print(f"本次登录尝试失败：{e}")
+
+            # 到这里说明本次失败了
+            if attempt < max_retry:
+                print("准备刷新验证码后重试。")
 
                 try:
-                    self._fill_username(page)
-                    self._fill_password(page)
-
-                    # 如果页面上有验证码，则识别、计算并填写
-                    self._fill_captcha_if_present(page)
-
-                    page.get_by_role("button", name="登录").click()
-                    page.wait_for_timeout(3000)
-
-                    # 登录后进入 Luna
-                    page.goto(config.JUMP_LUNA_URL)
-                    page.wait_for_load_state("domcontentloaded")
-                    page.wait_for_timeout(2500)
-
-                    # 如果已经不在登录页，说明登录成功
-                    if not self.is_login_page(page):
-                        print("JumpServer 登录成功。")
-                        return
-
-                    print("登录后仍停留在登录页，可能是验证码错误、账号密码错误或需要二次验证。")
-
-                except Exception as e:
-                    print(f"本次登录尝试失败：{e}")
-
-                # 到这里说明本次失败了
-                if attempt < max_retry:
-                    print("准备刷新验证码后重试。")
-
-                    try:
-                        # 确保回到登录页
-                        if not self.is_login_page(page):
-                            page.goto(config.JUMP_LOGIN_URL)
-                            page.wait_for_load_state("domcontentloaded")
-                            page.wait_for_timeout(1000)
-
+                    # 如果还在登录页，只刷新验证码即可，不要重复 goto 登录页
+                    if self.is_login_page(page):
                         self._refresh_captcha_if_present(page)
-                        page.wait_for_timeout(1000)
-
-                    except Exception as refresh_error:
-                        print(f"刷新验证码失败，重新打开登录页：{refresh_error}")
+                        page.wait_for_timeout(800)
+                    else:
+                        # 页面状态异常时，才重新打开登录页
                         page.goto(config.JUMP_LOGIN_URL)
                         page.wait_for_load_state("domcontentloaded")
-                        page.wait_for_timeout(1500)
+                        page.wait_for_timeout(800)
 
-                    continue
+                except Exception as refresh_error:
+                    print(f"刷新验证码失败，重新打开登录页：{refresh_error}")
+                    page.goto(config.JUMP_LOGIN_URL)
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(800)
 
-                raise RuntimeError(
-                    "JumpServer 登录失败。\n"
-                    "已重试 3 次。\n"
-                    "请检查账号密码是否正确，或者验证码识别失败，或者页面需要二次验证。"
-                )
+                continue
 
-        # 如果没有识别到登录表单，也尝试进入 Luna
-        page.goto(config.JUMP_LUNA_URL)
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(2500)
-
-        if self.is_login_page(page):
             raise RuntimeError(
-                "JumpServer 登录后仍停留在登录页。"
-                "请检查账号密码是否正确，或者页面是否需要验证码/二次验证。"
+                f"JumpServer 登录失败。\n"
+                f"已重试 {max_retry} 次。\n"
+                "请检查账号密码是否正确，或者验证码识别失败，或者页面需要二次验证。"
             )
 
     def is_login_page(self, page) -> bool:
