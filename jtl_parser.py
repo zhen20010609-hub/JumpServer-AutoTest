@@ -2,11 +2,26 @@
 
 import re
 import csv
+import sys
 import math
 import html
 import json
 from collections import Counter
 
+def set_csv_field_size_limit():
+    """
+    放大 CSV 单字段读取上限。
+    JMeter 的 JTL 如果保存了 requestData / responseData，
+    单个字段可能非常大，Python csv 默认 131072 会报错。
+    """
+    max_size = sys.maxsize
+
+    while True:
+        try:
+            csv.field_size_limit(max_size)
+            return
+        except OverflowError:
+            max_size = max_size // 10
 
 def percentile_nearest(values, percent):
     """
@@ -139,6 +154,9 @@ def parse_csv_jtl(file_path, encoding):
     会过滤 label 中包含 token 的请求。
     如果 CSV 里有 URL / requestData / responseData 字段，也会尝试提取。
     """
+
+    set_csv_field_size_limit()
+
     elapsed_list = []
     start_times = []
     end_times = []
